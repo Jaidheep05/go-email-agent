@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -13,12 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/go-resty/resty/v2"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	calendar "google.golang.org/api/calendar/v3"
 	gmail "google.golang.org/api/gmail/v1"
+	calendar "google.golang.org/api/calendar/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -34,10 +32,10 @@ func normalizeDate(dateStr string) string {
 	if dateStr == "" {
 		return ""
 	}
-
+	
 	// Current year (2026) + next few years
 	currentYear := time.Now().Year()
-
+	
 	// Fix wrong years from AI (2023/2024 → 2026)
 	re := regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})`)
 	if matches := re.FindStringSubmatch(dateStr); len(matches) == 4 {
@@ -48,29 +46,29 @@ func normalizeDate(dateStr string) string {
 		}
 		return dateStr
 	}
-
+	
 	// Handle common patterns
 	replacements := map[string]string{
-		"31st Jan":   fmt.Sprintf("%d-01-31", currentYear),
-		"Jan 31":     fmt.Sprintf("%d-01-31", currentYear),
-		"January 31": fmt.Sprintf("%d-01-31", currentYear),
-		"Jan 31st":   fmt.Sprintf("%d-01-31", currentYear),
-		"tomorrow":   time.Now().Add(24 * time.Hour).Format("2006-01-02"),
-		"today":      time.Now().Format("2006-01-02"),
+		"31st Jan":    fmt.Sprintf("%d-01-31", currentYear),
+		"Jan 31":      fmt.Sprintf("%d-01-31", currentYear),
+		"January 31":  fmt.Sprintf("%d-01-31", currentYear),
+		"Jan 31st":    fmt.Sprintf("%d-01-31", currentYear),
+		"tomorrow":    time.Now().Add(24 * time.Hour).Format("2006-01-02"),
+		"today":       time.Now().Format("2006-01-02"),
 	}
-
+	
 	dateLower := strings.ToLower(dateStr)
 	for input, output := range replacements {
 		if strings.Contains(dateLower, input) {
 			return output
 		}
 	}
-
+	
 	// Already YYYY-MM-DD format
 	if len(dateStr) >= 10 && dateStr[4] == '-' && dateStr[7] == '-' {
 		return dateStr
 	}
-
+	
 	return "" // Invalid format
 }
 
@@ -79,12 +77,12 @@ func isValidDate(dateStr string) bool {
 	if dateStr == "" || len(dateStr) < 10 {
 		return false
 	}
-
+	
 	t, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
 		return false
 	}
-
+	
 	// Must be within next 30 days or today
 	return t.After(time.Now().Add(-24*time.Hour)) && t.Before(time.Now().Add(30*24*time.Hour))
 }
@@ -339,10 +337,6 @@ func getClient(config *oauth2.Config) *http.Client {
 }
 
 func main() {
-	fmt.Println("🤖 Starting AI Email Agent with Web Dashboard...")
-	fmt.Println("🌐 Open: http://localhost:8080/dashboard")
-
-	// Your existing Gmail/Calendar setup
 	b, err := ioutil.ReadFile("credentials.json")
 	if err != nil {
 		log.Fatalf("Error reading credentials.json: %v", err)
@@ -363,24 +357,90 @@ func main() {
 		log.Fatalf("Unable to create Calendar service: %v", err)
 	}
 
-	// 🚀 NEW: Web Dashboard Router
-	r := chi.NewRouter()
-	r.Mount("/dashboard", dashboardRoutes())
+	user := "me"
+	req := gmailSrv.Users.Messages.List(user).Q("newer_than:1d")
+	resp, err := req.Do()
+	if err != nil {
+		log.Fatalf("Unable to retrieve messages: %v", err)
+	}
 
-	// 🚀 Make Gmail/Calendar services globally accessible
-	// (Add to global vars or pass via context)
+	if len(resp.Messages) == 0 {
+		fmt.Println("No new emails in the last 24 hours.")
+		return
+	}
 
-	fmt.Println("✅ Dashboard ready! Ollama must be running (ollama serve)")
-	log.Fatal(http.ListenAndServe(":8080", r))
-}
+	fmt.Printf("Found %d emails received in the last 24 hours:\n\n", len(resp.Messages))
 
-// Minimal dashboard handler to keep build clean
-func dashboardRoutes() http.Handler {
-	r := chi.NewRouter()
-	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		tmpl := template.Must(template.New("dash").Parse(`<html><body><h1>AI Email Agent Dashboard</h1><p>Open <a href="/dashboard">/dashboard</a></p></body></html>`))
-		tmpl.Execute(w, nil)
-	})
-	return r
+	for _, msg := range resp.Messages {
+		var m *gmail.Message
+		var err error
+		
+		// Retry logic for network issues
+		for attempt := 1; attempt <= 3; attempt++ {
+			m, err = gmailSrv.Users.Messages.Get(user, msg.Id).Format("full").Do()
+			if err == nil {
+				break
+			}
+			fmt.Printf("Attempt %d failed for %s: %v. Retrying...\n", attempt, msg.Id, err)
+			time.Sleep(2 * time.Second)
+		}
+		
+		if err != nil {
+			log.Printf("Failed to get message %s after 3 retries: %v\n", msg.Id, err)
+			continue
+		}
+
+		receivedTime := ""
+		if m.InternalDate > 0 {
+			t := time.Unix(m.InternalDate/1000, 0)
+			receivedTime = t.Format("2006-01-02 15:04:05 MST")
+		}
+
+		subject := ""
+		from := ""
+		for _, header := range m.Payload.Headers {
+			if header.Name == "Subject" {
+				subject = header.Value
+			}
+			if header.Name == "From" {
+				from = header.Value
+			}
+		}
+		snippet := m.Snippet
+
+		emailContent := fmt.Sprintf("From: %s\nSubject: %s\nSnippet: %s", from, subject, snippet)
+		summary, err := SummarizeWithOllama(context.Background(), emailContent)
+		if err != nil {
+			summary = fmt.Sprintf("AI summary failed: %v", err)
+		}
+
+		fmt.Println("------------------------------------------------")
+		fmt.Printf("From   : %s\n", from)
+		fmt.Printf("Subject: %s\n", subject)
+		fmt.Printf("Time   : %s\n", receivedTime)
+		fmt.Printf("Snippet: %s\n", snippet)
+		fmt.Println("**** AI Summary ****")
+		fmt.Println(summary)
+
+		if strings.Contains(summary, "Event Title:") && !strings.Contains(summary, "No events found.") {
+			title, date, start, end, location, notes := parseEventFromSummary(summary)
+			fmt.Printf("  [DEBUG] Parsed: Title='%s' Date='%s' Start='%s'\n", title, date, start)
+			
+			date = normalizeDate(date) // Fix date format
+			fmt.Printf("  [DEBUG] Normalized Date: '%s'\n", date)
+			
+			if len(title) > 0 && len(date) >= 8 && isValidDate(date) {
+				fmt.Printf("  [DEBUG] Creating event with date: %s\n", date)
+				err := createCalendarEvent(calendarSrv, title, date, start, end, location, notes)
+				if err != nil {
+					fmt.Printf("  [!] Failed to create calendar event: %v\n", err)
+				} else {
+					fmt.Printf("  [+] Calendar event created: %s on %s\n", title, date)
+				}
+			} else {
+				fmt.Printf("  [SKIP] Invalid event data: Title='%s' Date='%s' (len=%d valid=%t)\n", title, date, len(date), isValidDate(date))
+			}
+		}
+		fmt.Println("------------------------------------------------")
+	}
 }
